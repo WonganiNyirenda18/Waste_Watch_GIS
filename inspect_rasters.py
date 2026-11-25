@@ -4,28 +4,24 @@ from pathlib import Path
 
 DATA_FOLDER = Path("../data/population")
 
-files = [
-    "mwi_pop_2025_CN_100m_R2024B_v1.tif",
-    "Lilongwe_Density.tif"
-]
+filename = "Lilongwe_Population_Clipped.tif"
+filepath = DATA_FOLDER / filename
 
-for filename in files:
-    filepath = DATA_FOLDER / filename
+with rasterio.open(filepath) as raster:
+    population = raster.read(1, masked=True)
 
-    print("\n" + "=" * 50)
-    print(f"FILE: {filename}")
-    print("=" * 50)
+    print("WORLDPOP - LILONGWE VALIDATION")
+    print("--------------------------------")
+    print("CRS:", raster.crs)
+    print("Width:", raster.width)
+    print("Height:", raster.height)
+    print("Resolution:", raster.res)
+    print("NoData:", raster.nodata)
+    print("Valid pixels:", population.count())
+    print("Minimum population:", population.min())
+    print("Maximum population:", population.max())
 
-    with rasterio.open(filepath) as raster:
-        print("CRS:", raster.crs)
-        print("Width:", raster.width)
-        print("Height:", raster.height)
-        print("Bands:", raster.count)
-        print("Resolution:", raster.res)
-        print("NoData:", raster.nodata)
-        print("Bounds:", raster.bounds)
+    total_population = float(population.sum())
 
-        values = raster.read(1, masked=True)
-
-        print("Minimum:", values.min())
-        print("Maximum:", values.max())
+    print("--------------------------------")
+    print("Estimated population total:", total_population)
