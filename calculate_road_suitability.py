@@ -157,6 +157,20 @@ print("Minimum distance:", np.min(distance_array))
 print("Maximum distance:", np.max(distance_array))
 
 
+//add after this line
+valid_distances = distance_array[valid_mask]
+
+print("Maximum distance inside study area:",
+      np.max(valid_distances))
+
+print("Cells at least 2000m from roads:",
+      np.count_nonzero(valid_distances >= 2000))
+
+//valid scores
+print("Score percentiles:",
+      np.percentile(valid_scores, [0, 25, 50, 75, 100]))
+
+
 # --------------------------------------------------
 # 7. CALCULATE ROAD SUITABILITY
 # --------------------------------------------------
@@ -232,10 +246,3 @@ print("\nOutputs:")
 print(DISTANCE_OUTPUT)
 print(SUITABILITY_OUTPUT)
 
-valid_distances = distance_array[valid_mask]
-
-print("Maximum distance inside study area:",
-      np.max(valid_distances))
-
-print("Cells at least 2000m from roads:",
-      np.count_nonzero(valid_distances >= 2000))
