@@ -4,11 +4,13 @@ import numpy as np
 import rasterio
 
 # ==========================================
-# WASTEWATCH GIS - WEIGHTED OVERLAY ANALYSIS
+# WASTEWATCH GIS
+# FINAL WEIGHTED SUITABILITY ANALYSIS
+# WITH MANDATORY EXCLUSIONS
 # ==========================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "..", "data")
+DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data"))
 
 RASTERS = {
     "water": os.path.join(
@@ -29,6 +31,15 @@ RASTERS = {
         DATA_DIR, "landuse", "Lilongwe_Landuse_Suitability.tif"
     )
 }
+
+EXCLUSION_MASK = os.path.join(
+    DATA_DIR, "results", "Lilongwe_Exclusion_Mask.tif"
+)
+
+OUTPUT_DIR = os.path.join(DATA_DIR, "results")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+NODATA = -9999.0
 
 # ==========================================
 # WEIGHTING PROFILES
@@ -58,26 +69,78 @@ PROFILES = {
     }
 }
 
-# Select the default profile
+# Default profile when running this script directly
 SELECTED_PROFILE = "balanced"
 
-OUTPUT_DIR = os.path.join(DATA_DIR, "results")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-OUTPUT_FILE = os.path.join(
-    OUTPUT_DIR,
-    f"Lilongwe_{SELECTED_PROFILE.title()}_Suitability.tif"
-)
+# ==========================================
+# VALIDATE WEIGHTS
+# ==========================================
 
-NODATA = -9999.0
+def validate_weights(weights):
 
+    required_criteria = {
+        "water",
+        "residential",
+        "roads",
+        "population",
+        "landuse"
+    }
+
+    if not isinstance(weights, dict):
+        raise ValueError("Weights must be provided as an object.")
+
+    if set(weights.keys()) != required_criteria:
+        raise ValueError(
+            "Weights must contain exactly: "
+            "water, residential, roads, population, landuse."
+        )
+
+    validated_weights = {}
+
+    for criterion, weight in weights.items():
+
+        if isinstance(weight, (bool, np.bool_)):
+            raise ValueError(
+                f"Weight for {criterion} must be numeric."
+            )
+
+        if not isinstance(weight, (int, float, np.number)):
+            raise ValueError(
+                f"Weight for {criterion} must be numeric."
+            )
+
+        weight = float(weight)
+
+        if not np.isfinite(weight) or weight < 0:
+            raise ValueError(
+                f"Weight for {criterion} must be finite "
+                "and non-negative."
+            )
+
+        validated_weights[criterion] = weight
+
+    if not np.isclose(
+        sum(validated_weights.values()),
+        100,
+        atol=1e-6
+    ):
+        raise ValueError("Weights must total exactly 100%.")
+
+    return validated_weights
+
+
+# ==========================================
+# LOAD SUITABILITY RASTERS
+# ==========================================
 
 def load_rasters():
+
     arrays = {}
     reference_profile = None
     reference_shape = None
 
-    print("Loading suitability rasters...")
+    print("\nLoading suitability rasters...")
 
     for name, path in RASTERS.items():
 
@@ -91,31 +154,31 @@ def load_rasters():
             array = src.read(1).astype(np.float32)
 
             if reference_profile is None:
+
                 reference_profile = src.profile.copy()
                 reference_shape = array.shape
 
             else:
+
                 if array.shape != reference_shape:
                     raise ValueError(
-                        f"{name} raster has a different shape."
+                        f"{name} has a different raster shape."
                     )
 
                 if src.transform != reference_profile["transform"]:
                     raise ValueError(
-                        f"{name} raster has a different grid transform."
+                        f"{name} has a different grid transform."
                     )
 
                 if src.crs != reference_profile["crs"]:
                     raise ValueError(
-                        f"{name} raster has a different CRS."
+                        f"{name} has a different CRS."
                     )
-
-            nodata = src.nodata
 
             valid = np.isfinite(array)
 
-            if nodata is not None:
-                valid &= array != nodata
+            if src.nodata is not None:
+                valid &= array != src.nodata
 
             arrays[name] = {
                 "data": array,
@@ -129,29 +192,77 @@ def load_rasters():
     return arrays, reference_profile
 
 
+# ==========================================
+# LOAD MANDATORY EXCLUSION MASK
+# ==========================================
+
+def load_exclusion_mask(reference_profile):
+
+    print("\nLoading mandatory exclusion mask...")
+
+    if not os.path.exists(EXCLUSION_MASK):
+        raise FileNotFoundError(
+            f"Exclusion mask not found: {EXCLUSION_MASK}"
+        )
+
+    with rasterio.open(EXCLUSION_MASK) as src:
+
+        if src.shape != (
+            reference_profile["height"],
+            reference_profile["width"]
+        ):
+            raise ValueError(
+                "Exclusion mask dimensions do not match."
+            )
+
+        if src.transform != reference_profile["transform"]:
+            raise ValueError(
+                "Exclusion mask grid does not match."
+            )
+
+        if src.crs != reference_profile["crs"]:
+            raise ValueError(
+                "Exclusion mask CRS does not match."
+            )
+
+        mask = src.read(1)
+
+        # 1 = excluded
+        # 0 = eligible
+        # 255 = outside analysis area
+        excluded = mask == 1
+
+        print(
+            f"Excluded cells: {np.count_nonzero(excluded)}"
+        )
+
+    return excluded
+
+
+# ==========================================
+# CALCULATE WEIGHTED OVERLAY
+# ==========================================
+
 def calculate_weighted_overlay(arrays, weights):
 
-    if sum(weights.values()) != 100:
-        raise ValueError(
-            "Weights must total exactly 100%."
-        )
-
-    if any(
-        not isinstance(weight, (int, float))
-        or not np.isfinite(weight)
-        or weight < 0
-        for weight in weights.values()
-    ):
-        raise ValueError(
-            "Weights must be finite, non-negative numbers."
-        )
+    weights = validate_weights(weights)
 
     shape = arrays["water"]["data"].shape
 
-    weighted_sum = np.zeros(shape, dtype=np.float64)
-    available_weight = np.zeros(shape, dtype=np.float64)
+    weighted_sum = np.zeros(
+        shape,
+        dtype=np.float64
+    )
 
-    landuse_missing = np.zeros(shape, dtype=bool)
+    available_weight = np.zeros(
+        shape,
+        dtype=np.float64
+    )
+
+    landuse_missing = np.zeros(
+        shape,
+        dtype=bool
+    )
 
     print("\nCombining suitability criteria...")
 
@@ -163,31 +274,68 @@ def calculate_weighted_overlay(arrays, weights):
         weighted_sum[valid] += data[valid] * weight
         available_weight[valid] += weight
 
-        print(
-            f"{name}: weight {weight}% | "
-            f"valid cells {np.count_nonzero(valid)}"
-        )
-
         if name == "landuse":
             landuse_missing = ~valid
 
-    result = np.full(shape, NODATA, dtype=np.float32)
+        print(
+            f"{name}: {weight}% | "
+            f"{np.count_nonzero(valid)} valid cells"
+        )
+
+    result = np.full(
+        shape,
+        NODATA,
+        dtype=np.float32
+    )
 
     valid_result = available_weight > 0
 
     result[valid_result] = (
-        weighted_sum[valid_result]
-        / available_weight[valid_result]
+        weighted_sum[valid_result] /
+        available_weight[valid_result]
     ).astype(np.float32)
 
     return result, valid_result, landuse_missing
 
 
+# ==========================================
+# APPLY MANDATORY EXCLUSIONS
+# ==========================================
+
+def apply_exclusions(result, valid, excluded):
+
+    print("\nApplying mandatory exclusions...")
+
+    valid_before = np.count_nonzero(valid)
+
+    # Excluded locations must never receive
+    # a suitability score.
+    result[excluded] = NODATA
+    valid[excluded] = False
+
+    print(f"Valid cells before exclusion: {valid_before}")
+
+    print(
+        f"Excluded cells in mask: "
+        f"{np.count_nonzero(excluded)}"
+    )
+
+    print(
+        f"Valid cells after exclusion: "
+        f"{np.count_nonzero(valid)}"
+    )
+
+    return result, valid
+
+
+# ==========================================
+# CLASSIFY SUITABILITY
+# ==========================================
+
 def classify_suitability(result, valid):
 
-    classified = np.full(
+    classified = np.zeros(
         result.shape,
-        0,
         dtype=np.uint8
     )
 
@@ -197,8 +345,14 @@ def classify_suitability(result, valid):
     classified[valid & (result >= 60) & (result < 80)] = 4
     classified[valid & (result >= 80)] = 5
 
+    # 0 = NoData / outside analysis area
+
     return classified
 
+
+# ==========================================
+# SAVE RASTER
+# ==========================================
 
 def save_raster(data, reference_profile, output_path, nodata):
 
@@ -212,38 +366,84 @@ def save_raster(data, reference_profile, output_path, nodata):
         nodata=nodata
     )
 
-    with rasterio.open(output_path, "w", **profile) as dst:
+    with rasterio.open(
+        output_path,
+        "w",
+        **profile
+    ) as dst:
+
         dst.write(data, 1)
 
 
-def main():
+# ==========================================
+# RUN SUITABILITY ANALYSIS
+# ==========================================
 
-    weights = PROFILES[SELECTED_PROFILE]
+def run_analysis(profile="balanced", custom_weights=None):
 
-    print("===================================")
+    # Select weighting profile or custom weights
+    if custom_weights is not None:
+
+        selected_profile = "custom"
+        weights = validate_weights(custom_weights)
+
+    else:
+
+        if profile not in PROFILES:
+            raise ValueError(
+                f"Unknown profile: {profile}. "
+                f"Available profiles: {list(PROFILES.keys())}"
+            )
+
+        selected_profile = profile
+        weights = validate_weights(PROFILES[profile])
+
+    print("\n======================================")
     print("WASTEWATCH GIS")
-    print("WEIGHTED SUITABILITY ANALYSIS")
-    print("===================================")
+    print("FINAL SUITABILITY ANALYSIS")
+    print("======================================")
 
-    print(f"\nSelected profile: {SELECTED_PROFILE}")
+    print(f"Selected profile: {selected_profile}")
     print(f"Weights: {weights}")
 
+    # Load input rasters
     arrays, reference_profile = load_rasters()
 
+    # Load exclusion mask
+    excluded = load_exclusion_mask(reference_profile)
+
+    # Calculate weighted overlay
     result, valid, landuse_missing = (
         calculate_weighted_overlay(arrays, weights)
     )
 
-    classified = classify_suitability(result, valid)
+    # Apply mandatory exclusions
+    result, valid = apply_exclusions(
+        result,
+        valid,
+        excluded
+    )
+
+    # Classify results
+    classified = classify_suitability(
+        result,
+        valid
+    )
+
+    # ======================================
+    # OUTPUT FILES
+    # ======================================
+
+    prefix = f"Lilongwe_{selected_profile.title()}"
 
     score_output = os.path.join(
         OUTPUT_DIR,
-        f"Lilongwe_{SELECTED_PROFILE.title()}_Suitability.tif"
+        f"{prefix}_Suitability.tif"
     )
 
     classification_output = os.path.join(
         OUTPUT_DIR,
-        f"Lilongwe_{SELECTED_PROFILE.title()}_Classes.tif"
+        f"{prefix}_Classes.tif"
     )
 
     missing_output = os.path.join(
@@ -265,47 +465,133 @@ def main():
         0
     )
 
+    # Create missing land-use mask.
+    # 1 = missing land-use data in eligible cell
+    # 0 = land-use data available in eligible cell
+    # 255 = excluded or outside analysis area
+
+    missing_mask = np.full(
+        landuse_missing.shape,
+        255,
+        dtype=np.uint8
+    )
+
+    missing_mask[valid] = (
+        landuse_missing[valid].astype(np.uint8)
+    )
+
     save_raster(
-        landuse_missing.astype(np.uint8),
+        missing_mask,
         reference_profile,
         missing_output,
         255
     )
 
-    print("\n===================================")
-    print("WEIGHTED ANALYSIS COMPLETED")
-    print("===================================")
+    # ======================================
+    # STATISTICS
+    # ======================================
 
-    print(f"Valid output cells: {np.count_nonzero(valid)}")
-    print(f"Missing land-use cells: {np.count_nonzero(landuse_missing & valid)}")
+    classification_labels = {
+        1: "Very Low",
+        2: "Low",
+        3: "Moderate",
+        4: "High",
+        5: "Very High"
+    }
 
-    if np.any(valid):
+    classification_counts = {}
+
+    for code, label in classification_labels.items():
+
+        classification_counts[label] = int(
+            np.count_nonzero(classified == code)
+        )
+
+    valid_cells = int(
+        np.count_nonzero(valid)
+    )
+
+    missing_landuse_cells = int(
+        np.count_nonzero(landuse_missing & valid)
+    )
+
+    if valid_cells > 0:
 
         values = result[valid]
 
-        print(f"Minimum score: {values.min():.2f}")
-        print(f"Maximum score: {values.max():.2f}")
-        print(f"Mean score: {values.mean():.2f}")
-
-        print("\nSuitability classification:")
-
-        labels = {
-            1: "Very Low",
-            2: "Low",
-            3: "Moderate",
-            4: "High",
-            5: "Very High"
+        statistics = {
+            "minimum_score": float(values.min()),
+            "maximum_score": float(values.max()),
+            "mean_score": float(values.mean())
         }
 
-        for code, label in labels.items():
-            count = np.count_nonzero(classified == code)
-            print(f"{label}: {count} cells")
+    else:
+
+        statistics = {
+            "minimum_score": None,
+            "maximum_score": None,
+            "mean_score": None
+        }
+
+    # ======================================
+    # DISPLAY RESULTS
+    # ======================================
+
+    print("\n======================================")
+    print("FINAL SUITABILITY ANALYSIS COMPLETE")
+    print("======================================")
+
+    print(f"Valid output cells: {valid_cells}")
+
+    print(
+        "Missing land-use cells among eligible locations: "
+        f"{missing_landuse_cells}"
+    )
+
+    print("\nSuitability statistics:")
+
+    for name, value in statistics.items():
+        print(f"{name}: {value}")
+
+    print("\nSuitability classification:")
+
+    for label, count in classification_counts.items():
+        print(f"{label}: {count} cells")
 
     print("\nOutput files:")
     print(score_output)
     print(classification_output)
     print(missing_output)
 
+    # Return results for Flask or another application
+    return {
+        "status": "success",
+        "profile": selected_profile,
+        "weights": weights,
+        "valid_cells": valid_cells,
+        "missing_landuse_cells": missing_landuse_cells,
+        "statistics": statistics,
+        "classification_counts": classification_counts,
+        "outputs": {
+            "suitability_raster": os.path.abspath(
+                score_output
+            ),
+            "classification_raster": os.path.abspath(
+                classification_output
+            ),
+            "missing_landuse_mask": os.path.abspath(
+                missing_output
+            )
+        }
+    }
+
+
+# ==========================================
+# RUN DIRECTLY
+# ==========================================
 
 if __name__ == "__main__":
-    main()
+
+    run_analysis(
+        profile=SELECTED_PROFILE
+    )
